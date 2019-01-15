@@ -9,7 +9,10 @@
 
 #include "gurobi_c++.h"
 
-///Gravitational constant in m/s^2
+/// Enable keyboard control
+constexpr bool keyboard = false;
+
+/// Gravitational constant in m/s^2
 constexpr Float gravity = 9.81;
 
 /// The ratio between the maximum acceleration of the trajectory and the maximum
@@ -572,171 +575,194 @@ public:
     void update(std::function<bool(guint key)> keyPressed, MouseInfo& mouse, Float dt) override {
         dt += last_dt;
         while(dt > 0){
-            if(next_controller_time <= 0){
+            if(next_controller_time <= 0) {
                 last_x = trajectory.path().nearest_on_path(Vector2(state[Model::X], state[Model::Z]), last_x);
 
-                //TODO start using async futures to run this in parallel for 100ms
-                //Check if it's time to do MPC
-                if(next_mpc_count == 0){
-                    next_mpc_count = mpc_controller_periods;
-
-                    int commands = 5;
-                    int state_size = 6;
-                    int variables_size = commands + state_size;
-                    int n = mpc_states_per_period * mpc_periods_ahead * variables_size;
-
-                    GRBModel model(gurobi);
-
-                    GRBQuadExpr obj;
-                    //Initial state to make the code consistent between time steps
-                    GRBVar old_x = model.addVar(0, 0, 0.0, GRB_CONTINUOUS);
-                    GRBVar old_z = model.addVar(0, 0, 0.0, GRB_CONTINUOUS);
-                    GRBVar old_vx = model.addVar(0, 0, 0.0, GRB_CONTINUOUS);
-                    GRBVar old_vz = model.addVar(0, 0, 0.0, GRB_CONTINUOUS);
-                    GRBVar old_h = model.addVar(0, 0, 0.0, GRB_CONTINUOUS);
-                    GRBVar old_w = model.addVar(0, 0, 0.0, GRB_CONTINUOUS);
-
-                    State future_state = state;
-                    Command future_command = command;
-                    Float future_x = last_x;
-                    //Loop through all the time steps, adding variables to the model as we go
-                    for (int i = 0; i < mpc_states_per_period * mpc_periods_ahead; ++i) {
-                        Float mpc_dt = controller_period * mpc_controller_periods/mpc_states_per_period;
-                        Eigen::MatrixXd A = linearized_dynamics(future_state, future_command, mpc_dt);
-                        Eigen::MatrixXd B = linearized_command(future_state, future_command, mpc_dt);
-                        //TODO consider just constructing states assuming on path
-                        future_x = trajectory.path().nearest_on_path(Vector2(future_state[Model::X], future_state[Model::Z]), future_x);
-                        future_command = optimal_trajectory_command(future_state, future_command, trajectory, future_x);
-                        constexpr int mpc_dynamics_count = 10;
-                        for (int j = 0; j < mpc_dynamics_count ; ++j) {
-                            future_state = RK4<State, Command>(dynamics, future_state, future_command, mpc_dt/mpc_dynamics_count);
-                        }
-
-                        if(i < mpc_commands.size()){
-                            mpc_commands[i] = future_command;
-                        }
-
-                        //TODO consider optimizing to want less power (obj = -?)
-
-                        //Command variables for this time step
-                        GRBVar us = model.addVar(-steer_limit - future_command[FourWheelControl::Steer], steer_limit - future_command[FourWheelControl::Steer], 0.0, GRB_CONTINUOUS);
-                        GRBVar ufl = model.addVar(-1.0 - future_command[FourWheelControl::TFL], 1.0 - future_command[FourWheelControl::TFL], 0.0, GRB_CONTINUOUS);
-                        GRBVar ufr = model.addVar(-1.0 - future_command[FourWheelControl::TFR], 1.0 - future_command[FourWheelControl::TFR], 0.0, GRB_CONTINUOUS);
-                        GRBVar url = model.addVar(-1.0 - future_command[FourWheelControl::TRL], 1.0 - future_command[FourWheelControl::TRL], 0.0, GRB_CONTINUOUS);
-                        GRBVar urr = model.addVar(-1.0 - future_command[FourWheelControl::TRR], 1.0 - future_command[FourWheelControl::TRR], 0.0, GRB_CONTINUOUS);
-
-                        //State variables for this time step
-                        GRBVar x = model.addVar(-10000.0, 10000.0, 0.0, GRB_CONTINUOUS);
-                        GRBVar z = model.addVar(-10000.0, 10000.0, 0.0, GRB_CONTINUOUS);
-                        GRBVar vx = model.addVar(-10000.0, 10000.0, 0.0, GRB_CONTINUOUS);
-                        GRBVar vz = model.addVar(-10000.0, 10000.0, 0.0, GRB_CONTINUOUS);
-                        GRBVar h = model.addVar(-10000.0, 10000.0, 0.0, GRB_CONTINUOUS);
-                        GRBVar w = model.addVar(-10000.0, 10000.0, 0.0, GRB_CONTINUOUS);
-
-                        //Linearized Dynamics Constraints
-                        model.addConstr(x == us * B(0,0) + ufl * B(0, 1) + ufr * B(0, 2) + url * B(0, 3) + urr * B(0, 4)
-                            + old_x * A(0,0) + old_z * A(0, 1) + old_vx * A(0, 2) + old_vz * A(0, 3) + old_h * A(0, 4) + old_w * A(0, 5));
-                        model.addConstr(z == us * B(1,0) + ufl * B(1, 1) + ufr * B(1, 2) + url * B(1, 3) + urr * B(1, 4)
-                            + old_x * A(1,0) + old_z * A(1, 1) + old_vx * A(1, 2) + old_vz * A(1, 3) + old_h * A(1, 4) + old_w * A(1, 5));
-                        model.addConstr(vx == us * B(2,0) + ufl * B(2, 1) + ufr * B(2, 2) + url * B(2, 3) + urr * B(2, 4)
-                            + old_x * A(2,0) + old_z * A(2, 1) + old_vx * A(2, 2) + old_vz * A(2, 3) + old_h * A(2, 4) + old_w * A(2, 5));
-                        model.addConstr(vz == us * B(3,0) + ufl * B(3, 1) + ufr * B(3, 2) + url * B(3, 3) + urr * B(3, 4)
-                            + old_x * A(3,0) + old_z * A(3, 1) + old_vx * A(3, 2) + old_vz * A(3, 3) + old_h * A(3, 4) + old_w * A(3, 5));
-                        model.addConstr(h == us * B(4,0) + ufl * B(4, 1) + ufr * B(4, 2) + url * B(4, 3) + urr * B(4, 4)
-                            + old_x * A(4,0) + old_z * A(4, 1) + old_vx * A(4, 2) + old_vz * A(4, 3) + old_h * A(4, 4) + old_w * A(4, 5));
-                        model.addConstr(w == us * B(5,0) + ufl * B(5, 1) + ufr * B(5, 2) + url * B(5, 3) + urr * B(5, 4)
-                            + old_x * A(5,0) + old_z * A(5, 1) + old_vx * A(5, 2) + old_vz * A(5, 3) + old_h * A(5, 4) + old_w * A(5, 5));
-
-                        //Update the previous state error variables
-                        old_x = x;
-                        old_z = z;
-                        old_vx = vx;
-                        old_vz = vz;
-                        old_h = h;
-                        old_w = w;
-
-                        //Determine where we want the racecar to be
-                        Vector2 target_position = trajectory.path().position(future_x);
-                        Vector2 derivative = trajectory.path().derivative(future_x);
-                        Float path_angle = std::atan2(derivative[1], derivative[0]);
-                        Vector2 target_velocity = derivative * trajectory.get_speed(future_x)/derivative.norm();
-                        Float target_angular_velocity = target_velocity.norm()*trajectory.path().curvature(future_x);
-
-                        //Compute future error without MPC control inputs
-                        Float x_error = future_state[NonlinearModel::X] - target_position[0];
-                        Float z_error = future_state[NonlinearModel::Z] - target_position[1];
-                        Float vx_error = future_state[NonlinearModel::VX] - target_velocity[0];
-                        Float vz_error = future_state[NonlinearModel::VZ] - target_velocity[1];
-                        Float h_error = angle_near_zero(future_state[NonlinearModel::Heading] - path_angle);
-                        Float w_error = future_state[NonlinearModel::AngularVelocity] - target_angular_velocity;
-
-                        //Update the objective function, weighting the position and heading over the velocities.
-                        obj += 10*(x + x_error)*(x + x_error) + 10*(z+z_error)*(z+z_error)
-                             + (vx + vx_error)*(vx + vx_error) + (vz+vz_error)*(vz+vz_error)
-                             + 20*(h+h_error)*(h+h_error) + (w+w_error)*(w+w_error);
-                    }
-
-                    // Optimize model
-
-                    model.setObjective(obj);
-                    model.set(GRB_IntParam_OutputFlag, 0);
-                    model.optimize();
-
-                    //std::cout << x.get(GRB_StringAttr_VarName) << " "
-                    //          << x.get(GRB_DoubleAttr_X) << std::endl;
-                    //std::cout << y.get(GRB_StringAttr_VarName) << " "
-                    //          << y.get(GRB_DoubleAttr_X) << std::endl;
-                    //std::cout << z.get(GRB_StringAttr_VarName) << " "
-                    //          << z.get(GRB_DoubleAttr_X) << std::endl;
-
-                    std::cout << "Obj: " << model.get(GRB_DoubleAttr_ObjVal) << std::endl;
-
-                    for (int j = 0; j < mpc_commands.size(); ++j) {
-                        mpc_commands[j][FourWheelControl::Steer] += static_cast<Float>(
-                                model.getVar(state_size + j * variables_size + 0).get(GRB_DoubleAttr_X));
-                        //std::cout << mpc_commands[j][FourWheelControl::Steer] << " ";
-                        mpc_commands[j][FourWheelControl::TFL] += static_cast<Float>(
-                                model.getVar(state_size + j * variables_size + 1).get(GRB_DoubleAttr_X));
-                        mpc_commands[j][FourWheelControl::TFR] += static_cast<Float>(
-                                model.getVar(state_size + j * variables_size + 2).get(GRB_DoubleAttr_X));
-                        mpc_commands[j][FourWheelControl::TRL] += static_cast<Float>(
-                                model.getVar(state_size + j * variables_size + 3).get(GRB_DoubleAttr_X));
-                        mpc_commands[j][FourWheelControl::TRR] += static_cast<Float>(
-                                model.getVar(state_size + j * variables_size + 4).get(GRB_DoubleAttr_X));
-                        ///std::cout << model.getVar(state_size + j * variables_size + 0).get(GRB_DoubleAttr_X);
-                    }
-                }
-
-                //Look up the next command to execute
-                command = Command(//optimal_trajectory_command(state, command, trajectory, last_x)
-                                mpc_commands[mpc_commands.size() - next_mpc_count]
-                                );
-
-                command[FourWheelControl::Steer] = std::clamp(command[FourWheelControl::Steer], -steer_limit, steer_limit);
-                command[FourWheelControl::TFL] = std::clamp(command[FourWheelControl::TFL], static_cast<Float>(-1.f), static_cast<Float>(1.f));
-                command[FourWheelControl::TFR] = std::clamp(command[FourWheelControl::TFR], static_cast<Float>(-1.f), static_cast<Float>(1.f));
-                command[FourWheelControl::TRL] = std::clamp(command[FourWheelControl::TRL], static_cast<Float>(-1.f), static_cast<Float>(1.f));
-                command[FourWheelControl::TRR] = std::clamp(command[FourWheelControl::TRR], static_cast<Float>(-1.f), static_cast<Float>(1.f));
-
-                //command = mpc_commands[mpc_commands.size() - next_mpc_count];
-                next_mpc_count--;
-
-
-
-                constexpr bool keyboard = false;
                 //Override the commands with user control inputs
                 if(keyboard){
                     //Keyboard control
                     //command[FourWheelControl::Steer] = (keyPressed(GDK_KEY_Left) ? 1.f : 0.f) + (keyPressed(GDK_KEY_Right) ? -1.f : 0.f);
                     //Mouse control
-                    //command[FourWheelControl::Steer] = (std::abs(mouse.x) > 1.f ? 0 :
-                    //        (std::abs(mouse.x) > 1.f ? std::copysign(1.f, -mouse.x) : -mouse.x))*steer_limit;// - (state[Model::SteeringAngle] / steer_limit);
+                    command[FourWheelControl::Steer] = (std::abs(mouse.x) > 1.f ? 0 :
+                                                        (std::abs(mouse.x) > 1.f ? std::copysign(1.f, -mouse.x) : -mouse.x))*steer_limit;// - (state[Model::SteeringAngle] / steer_limit);
 
                     //Vector2 on_path = trajectory.path().position(last_x);
                     //std::cout << last_x << ", (" << on_path[0] << ", " << on_path[1] << "), (" << position[0] << ", " << position[1] << ")" << std::endl;
 
                     command[FourWheelControl::TFL] = command[FourWheelControl::TFR] = command[FourWheelControl::TRL] = command[FourWheelControl::TRR] =
                             (keyPressed(GDK_KEY_Up) ? 1.f : 0.f) + (keyPressed(GDK_KEY_Down) ? -1.f : 0.f) + 0.f;
+                }
+                else{
+                    //TODO start using async futures to run this in parallel for 100ms
+                    //Check if it's time to do MPC
+                    if (next_mpc_count == 0) {
+                        next_mpc_count = mpc_controller_periods;
+
+                        int commands = 5;
+                        int state_size = 6;
+                        int variables_size = commands + state_size;
+                        int n = mpc_states_per_period * mpc_periods_ahead * variables_size;
+
+                        GRBModel model(gurobi);
+
+                        GRBQuadExpr obj;
+                        //Initial state to make the code consistent between time steps
+                        GRBVar old_x = model.addVar(0, 0, 0.0, GRB_CONTINUOUS);
+                        GRBVar old_z = model.addVar(0, 0, 0.0, GRB_CONTINUOUS);
+                        GRBVar old_vx = model.addVar(0, 0, 0.0, GRB_CONTINUOUS);
+                        GRBVar old_vz = model.addVar(0, 0, 0.0, GRB_CONTINUOUS);
+                        GRBVar old_h = model.addVar(0, 0, 0.0, GRB_CONTINUOUS);
+                        GRBVar old_w = model.addVar(0, 0, 0.0, GRB_CONTINUOUS);
+
+                        State future_state = state;
+                        Command future_command = command;
+                        Float future_x = last_x;
+                        //Loop through all the time steps, adding variables to the model as we go
+                        for (int i = 0; i < mpc_states_per_period * mpc_periods_ahead; ++i) {
+                            Float mpc_dt = controller_period * mpc_controller_periods / mpc_states_per_period;
+                            Eigen::MatrixXd A = linearized_dynamics(future_state, future_command, mpc_dt);
+                            Eigen::MatrixXd B = linearized_command(future_state, future_command, mpc_dt);
+                            //TODO consider just constructing states assuming on path
+                            future_x = trajectory.path().nearest_on_path(
+                                    Vector2(future_state[Model::X], future_state[Model::Z]), future_x);
+                            future_command = optimal_trajectory_command(future_state, future_command, trajectory, future_x);
+                            constexpr int mpc_dynamics_count = 10;
+                            for (int j = 0; j < mpc_dynamics_count; ++j) {
+                                future_state = RK4<State, Command>(dynamics, future_state, future_command,
+                                                                   mpc_dt / mpc_dynamics_count);
+                            }
+
+                            if (i < mpc_commands.size()) {
+                                mpc_commands[i] = future_command;
+                            }
+
+                            //TODO consider optimizing to want less power (obj = -?)
+
+                            //Command variables for this time step
+                            GRBVar us = model.addVar(-steer_limit - future_command[FourWheelControl::Steer],
+                                                     steer_limit - future_command[FourWheelControl::Steer], 0.0,
+                                                     GRB_CONTINUOUS);
+                            GRBVar ufl = model.addVar(-1.0 - future_command[FourWheelControl::TFL],
+                                                      1.0 - future_command[FourWheelControl::TFL], 0.0, GRB_CONTINUOUS);
+                            GRBVar ufr = model.addVar(-1.0 - future_command[FourWheelControl::TFR],
+                                                      1.0 - future_command[FourWheelControl::TFR], 0.0, GRB_CONTINUOUS);
+                            GRBVar url = model.addVar(-1.0 - future_command[FourWheelControl::TRL],
+                                                      1.0 - future_command[FourWheelControl::TRL], 0.0, GRB_CONTINUOUS);
+                            GRBVar urr = model.addVar(-1.0 - future_command[FourWheelControl::TRR],
+                                                      1.0 - future_command[FourWheelControl::TRR], 0.0, GRB_CONTINUOUS);
+
+                            //State variables for this time step
+                            GRBVar x = model.addVar(-10000.0, 10000.0, 0.0, GRB_CONTINUOUS);
+                            GRBVar z = model.addVar(-10000.0, 10000.0, 0.0, GRB_CONTINUOUS);
+                            GRBVar vx = model.addVar(-10000.0, 10000.0, 0.0, GRB_CONTINUOUS);
+                            GRBVar vz = model.addVar(-10000.0, 10000.0, 0.0, GRB_CONTINUOUS);
+                            GRBVar h = model.addVar(-10000.0, 10000.0, 0.0, GRB_CONTINUOUS);
+                            GRBVar w = model.addVar(-10000.0, 10000.0, 0.0, GRB_CONTINUOUS);
+
+                            //Linearized Dynamics Constraints
+                            model.addConstr(
+                                    x == us * B(0, 0) + ufl * B(0, 1) + ufr * B(0, 2) + url * B(0, 3) + urr * B(0, 4)
+                                         + old_x * A(0, 0) + old_z * A(0, 1) + old_vx * A(0, 2) + old_vz * A(0, 3) +
+                                         old_h * A(0, 4) + old_w * A(0, 5));
+                            model.addConstr(
+                                    z == us * B(1, 0) + ufl * B(1, 1) + ufr * B(1, 2) + url * B(1, 3) + urr * B(1, 4)
+                                         + old_x * A(1, 0) + old_z * A(1, 1) + old_vx * A(1, 2) + old_vz * A(1, 3) +
+                                         old_h * A(1, 4) + old_w * A(1, 5));
+                            model.addConstr(
+                                    vx == us * B(2, 0) + ufl * B(2, 1) + ufr * B(2, 2) + url * B(2, 3) + urr * B(2, 4)
+                                          + old_x * A(2, 0) + old_z * A(2, 1) + old_vx * A(2, 2) + old_vz * A(2, 3) +
+                                          old_h * A(2, 4) + old_w * A(2, 5));
+                            model.addConstr(
+                                    vz == us * B(3, 0) + ufl * B(3, 1) + ufr * B(3, 2) + url * B(3, 3) + urr * B(3, 4)
+                                          + old_x * A(3, 0) + old_z * A(3, 1) + old_vx * A(3, 2) + old_vz * A(3, 3) +
+                                          old_h * A(3, 4) + old_w * A(3, 5));
+                            model.addConstr(
+                                    h == us * B(4, 0) + ufl * B(4, 1) + ufr * B(4, 2) + url * B(4, 3) + urr * B(4, 4)
+                                         + old_x * A(4, 0) + old_z * A(4, 1) + old_vx * A(4, 2) + old_vz * A(4, 3) +
+                                         old_h * A(4, 4) + old_w * A(4, 5));
+                            model.addConstr(
+                                    w == us * B(5, 0) + ufl * B(5, 1) + ufr * B(5, 2) + url * B(5, 3) + urr * B(5, 4)
+                                         + old_x * A(5, 0) + old_z * A(5, 1) + old_vx * A(5, 2) + old_vz * A(5, 3) +
+                                         old_h * A(5, 4) + old_w * A(5, 5));
+
+                            //Update the previous state error variables
+                            old_x = x;
+                            old_z = z;
+                            old_vx = vx;
+                            old_vz = vz;
+                            old_h = h;
+                            old_w = w;
+
+                            //Determine where we want the racecar to be
+                            Vector2 target_position = trajectory.path().position(future_x);
+                            Vector2 derivative = trajectory.path().derivative(future_x);
+                            Float path_angle = std::atan2(derivative[1], derivative[0]);
+                            Vector2 target_velocity = derivative * trajectory.get_speed(future_x) / derivative.norm();
+                            Float target_angular_velocity = target_velocity.norm() * trajectory.path().curvature(future_x);
+
+                            //Compute future error without MPC control inputs
+                            Float x_error = future_state[NonlinearModel::X] - target_position[0];
+                            Float z_error = future_state[NonlinearModel::Z] - target_position[1];
+                            Float vx_error = future_state[NonlinearModel::VX] - target_velocity[0];
+                            Float vz_error = future_state[NonlinearModel::VZ] - target_velocity[1];
+                            Float h_error = angle_near_zero(future_state[NonlinearModel::Heading] - path_angle);
+                            Float w_error = future_state[NonlinearModel::AngularVelocity] - target_angular_velocity;
+
+                            //Update the objective function, weighting the position and heading over the velocities.
+                            obj += 10 * (x + x_error) * (x + x_error) + 10 * (z + z_error) * (z + z_error)
+                                   + (vx + vx_error) * (vx + vx_error) + (vz + vz_error) * (vz + vz_error)
+                                   + 20 * (h + h_error) * (h + h_error) + (w + w_error) * (w + w_error);
+                        }
+
+                        // Optimize model
+
+                        model.setObjective(obj);
+                        model.set(GRB_IntParam_OutputFlag, 0);
+                        model.optimize();
+
+                        //std::cout << x.get(GRB_StringAttr_VarName) << " "
+                        //          << x.get(GRB_DoubleAttr_X) << std::endl;
+                        //std::cout << y.get(GRB_StringAttr_VarName) << " "
+                        //          << y.get(GRB_DoubleAttr_X) << std::endl;
+                        //std::cout << z.get(GRB_StringAttr_VarName) << " "
+                        //          << z.get(GRB_DoubleAttr_X) << std::endl;
+
+                        std::cout << "Obj: " << model.get(GRB_DoubleAttr_ObjVal) << std::endl;
+
+                        for (int j = 0; j < mpc_commands.size(); ++j) {
+                            mpc_commands[j][FourWheelControl::Steer] += static_cast<Float>(
+                                    model.getVar(state_size + j * variables_size + 0).get(GRB_DoubleAttr_X));
+                            //std::cout << mpc_commands[j][FourWheelControl::Steer] << " ";
+                            mpc_commands[j][FourWheelControl::TFL] += static_cast<Float>(
+                                    model.getVar(state_size + j * variables_size + 1).get(GRB_DoubleAttr_X));
+                            mpc_commands[j][FourWheelControl::TFR] += static_cast<Float>(
+                                    model.getVar(state_size + j * variables_size + 2).get(GRB_DoubleAttr_X));
+                            mpc_commands[j][FourWheelControl::TRL] += static_cast<Float>(
+                                    model.getVar(state_size + j * variables_size + 3).get(GRB_DoubleAttr_X));
+                            mpc_commands[j][FourWheelControl::TRR] += static_cast<Float>(
+                                    model.getVar(state_size + j * variables_size + 4).get(GRB_DoubleAttr_X));
+                            ///std::cout << model.getVar(state_size + j * variables_size + 0).get(GRB_DoubleAttr_X);
+                        }
+                    }
+
+                    //Look up the next command to execute
+                    command = Command(//optimal_trajectory_command(state, command, trajectory, last_x)
+                            mpc_commands[mpc_commands.size() - next_mpc_count]
+                    );
+
+                    command[FourWheelControl::Steer] = std::clamp(command[FourWheelControl::Steer], -steer_limit,
+                                                                  steer_limit);
+                    command[FourWheelControl::TFL] = std::clamp(command[FourWheelControl::TFL], static_cast<Float>(-1.f),
+                                                                static_cast<Float>(1.f));
+                    command[FourWheelControl::TFR] = std::clamp(command[FourWheelControl::TFR], static_cast<Float>(-1.f),
+                                                                static_cast<Float>(1.f));
+                    command[FourWheelControl::TRL] = std::clamp(command[FourWheelControl::TRL], static_cast<Float>(-1.f),
+                                                                static_cast<Float>(1.f));
+                    command[FourWheelControl::TRR] = std::clamp(command[FourWheelControl::TRR], static_cast<Float>(-1.f),
+                                                                static_cast<Float>(1.f));
+
+                    //command = mpc_commands[mpc_commands.size() - next_mpc_count];
+                    next_mpc_count--;
                 }
 
                 next_controller_time = controller_period;
